@@ -4,57 +4,48 @@ import functools as F
 import concurrent.futures
 import threading
 
-# Thread-local storage for persistent event loops
-_loop_local = threading.local()
-
-# Shared thread pool executor (lazily initialized)
+# Shared thread pool executor with a single worker to ensure all operations
+# use the same thread and event loop (important for loop-bound resources like subprocesses)
 _executor = None
 _executor_lock = threading.Lock()
+_worker_loop = None
+_worker_loop_lock = threading.Lock()
 
 def _get_executor():
-    """Get or create the shared executor."""
+    """Get or create the shared single-worker executor."""
     global _executor
     with _executor_lock:
         if _executor is None or _executor._shutdown:
-            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         return _executor
 
-def _get_or_create_loop():
-    """Get or create a persistent event loop for the current thread."""
-    if not hasattr(_loop_local, 'loop') or _loop_local.loop is None or _loop_local.loop.is_closed():
-        _loop_local.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_loop_local.loop)
-    return _loop_local.loop
+def _get_worker_loop():
+    """Get or create the persistent event loop for the worker thread."""
+    global _worker_loop
+    with _worker_loop_lock:
+        if _worker_loop is None or _worker_loop.is_closed():
+            _worker_loop = asyncio.new_event_loop()
+        return _worker_loop
+
+def _run_in_worker(coro):
+    """Run a coroutine in the worker thread's event loop."""
+    loop = _get_worker_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 def to_sync(func):
     """
     Wraps an async function to make it synchronous.
     
-    Uses a persistent event loop per thread to ensure async resources
-    (like subprocesses) work correctly across multiple calls.
-    
-    If called from within a running event loop, runs in a separate thread
-    with its own persistent loop.
+    Always runs in a dedicated worker thread with a persistent event loop
+    to ensure async resources (like subprocesses) work correctly across
+    multiple calls, regardless of whether the caller is in an async context.
     """
     @F.wraps(func)
     def wrapper(*args, **kwargs):
-        try:
-            asyncio.get_running_loop()
-            in_async_context = True
-        except RuntimeError:
-            in_async_context = False
-        
-        if in_async_context:
-            # We're inside a running event loop - run in a separate thread
-            executor = _get_executor()
-            future = executor.submit(
-                lambda: _get_or_create_loop().run_until_complete(func(*args, **kwargs))
-            )
-            return future.result()
-        else:
-            # No running loop - use persistent loop for this thread
-            loop = _get_or_create_loop()
-            return loop.run_until_complete(func(*args, **kwargs))
+        executor = _get_executor()
+        future = executor.submit(_run_in_worker, func(*args, **kwargs))
+        return future.result()
     return wrapper
 
 async def check_output(*args, **kwargs):
