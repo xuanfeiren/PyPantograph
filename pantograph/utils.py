@@ -2,30 +2,59 @@ import asyncio
 from pathlib import Path
 import functools as F
 import concurrent.futures
+import threading
+
+# Thread-local storage for persistent event loops
+_loop_local = threading.local()
+
+# Shared thread pool executor (lazily initialized)
+_executor = None
+_executor_lock = threading.Lock()
+
+def _get_executor():
+    """Get or create the shared executor."""
+    global _executor
+    with _executor_lock:
+        if _executor is None or _executor._shutdown:
+            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        return _executor
+
+def _get_or_create_loop():
+    """Get or create a persistent event loop for the current thread."""
+    if not hasattr(_loop_local, 'loop') or _loop_local.loop is None or _loop_local.loop.is_closed():
+        _loop_local.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop_local.loop)
+    return _loop_local.loop
 
 def to_sync(func):
     """
     Wraps an async function to make it synchronous.
     
-    If called from within a running event loop (e.g., Jupyter, async program),
-    runs the async function in a separate thread with its own event loop.
-    Otherwise, uses asyncio.run() to create a new event loop.
+    Uses a persistent event loop per thread to ensure async resources
+    (like subprocesses) work correctly across multiple calls.
+    
+    If called from within a running event loop, runs in a separate thread
+    with its own persistent loop.
     """
     @F.wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
+            in_async_context = True
         except RuntimeError:
-            loop = None
+            in_async_context = False
         
-        if loop is not None:
+        if in_async_context:
             # We're inside a running event loop - run in a separate thread
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, func(*args, **kwargs))
-                return future.result()
+            executor = _get_executor()
+            future = executor.submit(
+                lambda: _get_or_create_loop().run_until_complete(func(*args, **kwargs))
+            )
+            return future.result()
         else:
-            # No running loop - use asyncio.run
-            return asyncio.run(func(*args, **kwargs))
+            # No running loop - use persistent loop for this thread
+            loop = _get_or_create_loop()
+            return loop.run_until_complete(func(*args, **kwargs))
     return wrapper
 
 async def check_output(*args, **kwargs):
