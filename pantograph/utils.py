@@ -4,28 +4,32 @@ import functools as F
 import concurrent.futures
 import threading
 
-# Shared thread pool executor with a single worker to ensure all operations
-# use the same thread and event loop (important for loop-bound resources like subprocesses)
-_executor = None
-_executor_lock = threading.Lock()
-_worker_loop = None
-_worker_loop_lock = threading.Lock()
+# Thread-local storage: each thread gets its own executor and event loop
+# This enables parallel execution across multiple threads
+_thread_local = threading.local()
 
 def _get_executor():
-    """Get or create the shared single-worker executor."""
-    global _executor
-    with _executor_lock:
-        if _executor is None or _executor._shutdown:
-            _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        return _executor
+    """
+    Get or create a thread-local executor.
+    
+    Changed from global single-worker executor to thread-local executors
+    to enable parallel execution. Each thread now has its own executor,
+    allowing multiple Server instances to run concurrently.
+    """
+    if not hasattr(_thread_local, 'executor') or _thread_local.executor._shutdown:
+        _thread_local.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    return _thread_local.executor
 
 def _get_worker_loop():
-    """Get or create the persistent event loop for the worker thread."""
-    global _worker_loop
-    with _worker_loop_lock:
-        if _worker_loop is None or _worker_loop.is_closed():
-            _worker_loop = asyncio.new_event_loop()
-        return _worker_loop
+    """
+    Get or create a thread-local event loop.
+    
+    Changed from global event loop to thread-local loops to support
+    parallel execution across multiple threads.
+    """
+    if not hasattr(_thread_local, 'loop') or _thread_local.loop.is_closed():
+        _thread_local.loop = asyncio.new_event_loop()
+    return _thread_local.loop
 
 def _run_in_worker(coro):
     """Run a coroutine in the worker thread's event loop."""
